@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from .config import Settings, get_settings
 from .lua import (
     ACQUIRE_BATCH_LUA,
     ACQUIRE_LUA,
+    LIMIT_CHECK_LUA,
     RELEASE_LUA,
     RENEW_LUA,
     VALIDATE_LUA,
@@ -30,6 +32,8 @@ from .schemas import (
     AcquireRequest,
     AcquireResponse,
     LeaseStateResponse,
+    LimitCheckRequest,
+    LimitCheckResponse,
     ReleaseRequest,
     ReleaseResponse,
     RenewRequest,
@@ -51,15 +55,19 @@ async def lifespan(app: FastAPI):
         renew=redis.register_script(RENEW_LUA),
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
+        limit_check=redis.register_script(LIMIT_CHECK_LUA),
     )
     yield
     await redis.aclose()
 
 
 app = FastAPI(
-    title="Lease API",
+    title="Lease & Rate Limit API",
     version="1.0.0",
-    description="供多个工作进程协调独占任务的租约服务（FastAPI + Redis Lua）",
+    description=(
+        "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
+        "原子滑动窗口成本限流（FastAPI + Redis Lua）"
+    ),
     lifespan=lifespan,
 )
 
@@ -106,6 +114,22 @@ def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
     return ttl
 
 
+def limit_key(settings: Settings, client_key: str) -> str:
+    return f"{settings.limit_key_prefix}:{client_key}"
+
+
+def resolve_window(window_ms: int, settings: Settings) -> int:
+    if not settings.limits_min_window_ms <= window_ms <= settings.limits_max_window_ms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"window_ms must be within "
+                f"[{settings.limits_min_window_ms}, {settings.limits_max_window_ms}]"
+            ),
+        )
+    return window_ms
+
+
 @app.get("/healthz")
 async def healthz(redis: RedisDep) -> dict:
     await redis.ping()
@@ -114,7 +138,7 @@ async def healthz(redis: RedisDep) -> dict:
 
 @app.get("/")
 async def root() -> dict:
-    return {"service": "lease-api", "docs": "/docs"}
+    return {"service": "lease-rate-limit-api", "docs": "/docs"}
 
 
 @app.post("/v1/leases/acquire", response_model=AcquireResponse)
@@ -264,4 +288,60 @@ async def inspect(
         fencing_token=int(data["fencing"]),
         expires_at_ms=expires_at,
         remaining_ms=max(0, expires_at - now),
+    )
+
+
+@app.post(
+    "/v1/limits/check",
+    response_model=LimitCheckResponse,
+    tags=["rate-limits"],
+    summary="滑动窗口成本限流检查（通过即扣减）",
+    responses={
+        status.HTTP_429_TOO_MANY_REQUESTS: {"model": LimitCheckResponse},
+    },
+)
+async def check_limit(
+    req: LimitCheckRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> LimitCheckResponse:
+    """按 Redis 服务器时间统计滑动窗口内的累计成本并原子扣减。
+
+    - 未超限（`used + cost <= limit`）：原子记入本次成本，返回 **200**、
+      `remaining` 与 `reset_at_ms`（窗口内最老一笔成本滑出的时刻）。
+    - 超限：不扣减，返回 **429** 与 `retry_after_ms`（等待最老一笔成本滑出后重试），
+      同时携带标准 `Retry-After` 响应头（秒）。
+
+    "清理旧记录 → 累计 → 判定 → 扣减"由单个 Lua 脚本基于 Redis 服务器时间
+    原子执行，同一 `client_key` 的并发请求不会超额；窗口数据随滑动自动清理，
+    键在窗口清空后按 `PEXPIRE` 自动删除。
+    """
+    window = resolve_window(req.window_ms, settings)
+    result = await scripts.limit_check(
+        keys=[limit_key(settings, req.client_key)],
+        args=[req.limit, window, req.cost, uuid.uuid4().hex],
+    )
+    if result[0]:
+        return LimitCheckResponse(
+            allowed=True,
+            client_key=req.client_key,
+            limit=req.limit,
+            window_ms=window,
+            remaining=result[1],
+            reset_at_ms=result[2],
+        )
+
+    remaining, reset_at_ms, retry_after_ms = result[1], result[2], result[3]
+    response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    # 标准 Retry-After 以秒为单位，向上取整避免客户端过早重试
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after_ms / 1000)))
+    return LimitCheckResponse(
+        allowed=False,
+        client_key=req.client_key,
+        limit=req.limit,
+        window_ms=window,
+        remaining=remaining,
+        reset_at_ms=reset_at_ms,
+        retry_after_ms=retry_after_ms,
     )

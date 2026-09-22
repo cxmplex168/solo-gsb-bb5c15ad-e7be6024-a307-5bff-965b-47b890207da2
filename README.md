@@ -1,9 +1,14 @@
-# Lease API — 分布式独占任务租约服务
+# Lease & Rate Limit API — 分布式独占任务租约与滑动窗口限流服务
 
 供多个工作进程协调独占任务的租约 API。客户端按任务键（`task_key`）申请带 TTL 的
 租约；仅当任务未被占用或旧租约已过期时申请成功，并返回**所有权令牌**与**单调递增
 的防栅序号（fencing token）**。续租与释放必须同时校验令牌与防栅序号，旧持有者在
 超时后无法影响新租约；另提供校验接口，供下游判断一次操作是否仍属于当前租约。
+
+另提供 **Redis Lua 原子滑动窗口（成本）限流 API**：`POST /v1/limits/check`
+按 Redis 服务器时间累计滑动窗口内的请求成本，未超限则原子扣减并返回剩余额度，
+超限返回 `429` 与建议重试时间；同一 `client_key` 的并发请求不会超额，过期窗口
+数据自动清理。
 
 技术栈：Python 3.12 · FastAPI · Redis 7（Lua 脚本保证原子性）
 
@@ -35,6 +40,9 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | `LEASE_MIN_TTL_MS` | `100` | 允许的最小 TTL（毫秒） |
 | `LEASE_MAX_TTL_MS` | `300000` | 允许的最大 TTL（毫秒） |
 | `LEASE_DEFAULT_TTL_MS` | `10000` | 请求未指定 `ttl_ms` 时的默认值 |
+| `LIMIT_KEY_PREFIX` | `ratelimit` | 限流 Redis 键前缀，与租约键隔离 |
+| `LIMITS_MIN_WINDOW_MS` | `1` | 允许的最小限流窗口（毫秒） |
+| `LIMITS_MAX_WINDOW_MS` | `86400000` | 允许的最大限流窗口（毫秒，默认 1 天） |
 
 服务端口固定为 **8000**（容器内），可在 `docker-compose.yml` 的 `ports` 中调整宿主机映射。
 
@@ -50,6 +58,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/release` | 释放租约（幂等，始终 200） |
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
+| POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减），放行 200 / 超限 429 |
 | GET | `/healthz` | 健康检查 |
 
 ### 示例
@@ -98,6 +107,45 @@ curl -s -X POST localhost:8000/v1/leases/release \
   -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
 ```
 
+### 限流示例
+
+```bash
+# 窗口 1 秒、成本上限 3、本次成本 1：放行并返回剩余额度
+curl -s -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:send-sms", "limit": 3, "window_ms": 1000, "cost": 1}'
+# => 200
+# {"allowed":true,"client_key":"tenant-42:send-sms","limit":3,"window_ms":1000,
+#  "remaining":2,"reset_at_ms":1758...,"retry_after_ms":0}
+
+# 连续打满窗口后再次请求 => 429（不扣减任何成本）
+curl -i -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:send-sms", "limit": 3, "window_ms": 1000, "cost": 1}'
+# => HTTP/1.1 429 Too Many Requests
+#    Retry-After: 1
+# {"allowed":false,"client_key":"tenant-42:send-sms","limit":3,"window_ms":1000,
+#  "remaining":0,"reset_at_ms":1758...,"retry_after_ms":812}
+
+# cost 可表达加权成本（如批量条数、令牌数）；cost 不得大于 limit，否则 422
+curl -s -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:bulk", "limit": 100, "window_ms": 60000, "cost": 30}'
+# => 200 {"allowed":true,...,"remaining":70,...}
+```
+
+字段说明：
+
+| 字段 | 方向 | 说明 |
+| --- | --- | --- |
+| `client_key` | 请求 | 限流对象标识（1～512 字符），任意维度（租户 / 用户 / API） |
+| `limit` | 请求 | 单个窗口内允许累计的成本上限（≥1） |
+| `window_ms` | 请求 | 滑动窗口长度（毫秒，服务端限定 1～86400000） |
+| `cost` | 请求 | 本次成本（≥1，默认 1，且不得大于 `limit`） |
+| `remaining` | 响应 | 放行后窗口内剩余成本；超限时为未扣减情况下的剩余值 |
+| `reset_at_ms` | 响应 | 窗口内最老一笔成本滑出、可再获配额的时刻（Redis 服务器时钟，Unix 毫秒） |
+| `retry_after_ms` | 响应 | 仅 429 时非 0：建议等待毫秒数；响应头同时给出标准 `Retry-After`（秒，向上取整） |
+
 ## 设计要点
 
 - **原子性**：申请 / 批量申请 / 续租 / 释放 / 校验全部状态转换均由 Redis Lua 脚本
@@ -115,12 +163,30 @@ curl -s -X POST localhost:8000/v1/leases/release \
 - **双重过期保障**：租约 Hash 内记录 `expires_at`（判断依据），同时设置
   `PEXPIRE`（自动清理残留键）；判断以 `expires_at` 与服务器时间的比较为准。
 
+### 限流设计要点
+
+- **原子滑动窗口**：每次检查由单个 Lua 脚本依次完成
+  `ZREMRANGEBYSCORE` 清旧 → 遍历 member 累计成本 → 判定 → `ZADD` 扣减，
+  Redis 单线程执行脚本，同一 `client_key` 的并发请求严格串行判定，
+  不会出现"检查后扣减"的竞态，**并发请求绝不超额**（超限时不写入任何成本）。
+- **成本加权**：每笔请求携带整数 `cost`（批量条数、令牌数等），
+  member 形如 `<uuid>:<cost>`，cost 编码在 member 尾部由脚本解析累计；
+  uuid 保证同一毫秒并发请求的 member 不冲突。
+- **Redis 服务器时间**：窗口边界由 Lua 内 `TIME` 命令的服务器时钟确定，
+  不依赖调用方本地时间；`reset_at_ms` / `retry_after_ms` 均基于该时钟计算。
+- **过期数据自动清理**：滑出窗口的记录在下次检查时被 `ZREMRANGEBYSCORE`
+  即时删除，键同时设置 `PEXPIRE window_ms`，窗口结束后无流量时键也会自动消失，
+  不残留空窗口数据。
+- **超限语义**：超限时返回 `429`，响应体给出 `remaining`、`reset_at_ms`、
+  `retry_after_ms`，并携带标准 `Retry-After` 头（秒，向上取整）。
+
 ### Redis 数据模型
 
 | 键 | 类型 | 说明 |
 | --- | --- | --- |
 | `{prefix}:lease:{task_key}` | Hash（`token` / `fencing` / `expires_at`），带 PEXPIRE | 当前租约 |
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
+| `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 
 ## 冒烟测试
 
@@ -131,7 +197,9 @@ python3 scripts/smoke_test.py            # 默认打 http://localhost:8000
 ```
 
 覆盖：获取冲突、错误令牌/序号被拒绝、防栅序号单调递增、旧持有者超时后无法
-续租/释放/干扰新租约等场景。
+续租/释放/干扰新租约等场景；以及限流的剩余额度递减、成本加权、超限 429
+（含 `Retry-After` 头与不扣减语义）、窗口滑动后恢复、**20 并发恰好放行
+limit 笔不超额**、参数校验和过期数据自动清理。
 
 ## 本地开发（不用 Docker）
 
@@ -147,7 +215,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings）
-  lua.py       # 申请/批量申请/续租/释放/校验五个原子 Lua 脚本
+  lua.py       # 申请/批量申请/续租/释放/校验五个租约 Lua 脚本 + 滑动窗口限流 Lua 脚本
   schemas.py   # 请求 / 响应模型
   main.py      # FastAPI 应用、路由、Redis 生命周期
 scripts/

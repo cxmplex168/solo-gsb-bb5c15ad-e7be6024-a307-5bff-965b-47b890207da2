@@ -19,6 +19,9 @@ services:
       LEASE_MIN_TTL_MS: "100"
       LEASE_MAX_TTL_MS: "300000"
       LEASE_DEFAULT_TTL_MS: "10000"
+      LIMIT_KEY_PREFIX: "ratelimit"
+      LIMITS_MIN_WINDOW_MS: "1"
+      LIMITS_MAX_WINDOW_MS: "86400000"
     ports:
       - "8000:8000"
     depends_on:

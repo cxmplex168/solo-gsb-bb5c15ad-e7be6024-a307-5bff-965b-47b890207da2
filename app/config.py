@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     default_ttl_ms: int = Field(
         default=10_000, validation_alias="LEASE_DEFAULT_TTL_MS"
     )
+    # 限流键前缀，与租约键前缀隔离，便于多环境共用一个实例
+    limit_key_prefix: str = Field(default="ratelimit", validation_alias="LIMIT_KEY_PREFIX")
+    # window_ms 合法区间（毫秒），超出范围的限流请求会被拒绝
+    limits_min_window_ms: int = Field(
+        default=1, validation_alias="LIMITS_MIN_WINDOW_MS"
+    )
+    limits_max_window_ms: int = Field(
+        default=86_400_000, validation_alias="LIMITS_MAX_WINDOW_MS"
+    )
 
 
 @lru_cache

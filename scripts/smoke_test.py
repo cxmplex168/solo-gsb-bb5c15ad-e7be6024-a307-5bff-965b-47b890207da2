@@ -6,19 +6,27 @@
 
 覆盖场景：获取 / 冲突 / 校验 / 续租 / 释放 / 防栅序号单调递增 /
 旧持有者在超时后无法影响新租约，以及批量申请的全成全败、
-冲突时不写不递增、过期接管与凭据兼容。
+冲突时不写不递增、过期接管与凭据兼容；以及滑动窗口成本限流的
+剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
+参数校验 / 过期数据自动清理。
 """
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
 FAILED = []
 
 
 def call(method, path, body=None):
+    status_code, headers, data = call_ex(method, path, body)
+    return status_code, data
+
+
+def call_ex(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         BASE + path,
@@ -28,9 +36,9 @@ def call(method, path, body=None):
     )
     try:
         with urllib.request.urlopen(req) as resp:
-            return resp.status, json.loads(resp.read())
+            return resp.status, resp.headers, json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read())
+        return e.code, e.headers, json.loads(e.read())
 
 
 def check(name, cond, detail=""):
@@ -140,6 +148,7 @@ def main():
           f"{code} {st}")
 
     batch_checks()
+    limit_checks()
 
     print()
     if FAILED:
@@ -242,6 +251,119 @@ def batch_checks():
                    {"task_key": k1, "token": taken[k1]["token"],
                     "fencing_token": taken[k1]["fencing_token"]})
     check("batch new lease valid", code == 200 and v["valid"], f"{code} {v}")
+
+
+def limit_checks():
+    """/v1/limits/check：剩余额度 / 成本累计 / 429 / 窗口滑动 / 并发不超额 / 自动清理。"""
+    key = f"smoke-limit:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+
+    # 参数校验：limit=0 / cost=0 / cost>limit / 缺 window_ms / window 超界
+    code, b = call("POST", path, {"client_key": key, "limit": 0,
+                                  "window_ms": 1000, "cost": 1})
+    check("limit zero -> 422", code == 422, f"code={code} {b}")
+    code, b = call("POST", path, {"client_key": key, "limit": 10,
+                                  "window_ms": 1000, "cost": 0})
+    check("cost zero -> 422", code == 422, f"code={code} {b}")
+    code, b = call("POST", path, {"client_key": key, "limit": 5,
+                                  "window_ms": 1000, "cost": 6})
+    check("cost greater than limit -> 422", code == 422, f"code={code} {b}")
+    code, b = call("POST", path, {"client_key": key, "limit": 10, "cost": 1})
+    check("missing window_ms -> 422", code == 422, f"code={code} {b}")
+    code, b = call("POST", path, {"client_key": key, "limit": 10,
+                                  "window_ms": 90_000_000, "cost": 1})
+    check("window_ms out of range -> 400", code == 400, f"code={code} {b}")
+
+    # 逐笔扣减，remaining 递减到 0；空窗口的 reset_at_ms ≈ now + window
+    now_ms = int(time.time() * 1000)
+    code, b = call("POST", path, {"client_key": key, "limit": 3,
+                                  "window_ms": 10_000, "cost": 1})
+    check("limit allow #1", code == 200 and b["allowed"]
+          and b["remaining"] == 2, f"{code} {b}")
+    check("limit fresh reset_at near now+window",
+          abs(b["reset_at_ms"] - (now_ms + 10_000)) < 2000, f"{b}")
+    code, b = call("POST", path, {"client_key": key, "limit": 3,
+                                  "window_ms": 10_000, "cost": 1})
+    check("limit allow #2 remaining 1",
+          code == 200 and b["allowed"] and b["remaining"] == 1, f"{code} {b}")
+    code, b = call("POST", path, {"client_key": key, "limit": 3,
+                                  "window_ms": 10_000, "cost": 1})
+    check("limit allow #3 remaining 0",
+          code == 200 and b["allowed"] and b["remaining"] == 0, f"{code} {b}")
+
+    # 超限：429、不扣减、retry_after_ms 在 (0, window] 内，带 Retry-After 头
+    code, headers, b = call_ex("POST", path, {"client_key": key, "limit": 3,
+                                              "window_ms": 10_000, "cost": 1})
+    check("limit exceed -> 429",
+          code == 429 and not b["allowed"] and b["remaining"] == 0,
+          f"{code} {b}")
+    check("limit exceed retry_after_ms",
+          0 < b["retry_after_ms"] <= 10_000, f"{b}")
+    retry_after_hdr = headers.get("Retry-After")
+    check("limit exceed Retry-After header",
+          retry_after_hdr is not None and int(retry_after_hdr) >= 1,
+          f"Retry-After={retry_after_hdr}")
+    # 超限请求不扣减：再来一次结果完全一致
+    code, b2 = call("POST", path, {"client_key": key, "limit": 3,
+                                   "window_ms": 10_000, "cost": 1})
+    check("limit denied not charged",
+          code == 429 and b2["remaining"] == b["remaining"]
+          and b2["reset_at_ms"] == b["reset_at_ms"], f"{b} vs {b2}")
+
+    # 成本加权：独立键，limit=10：cost 6 放行剩 4，cost 5 拒绝，cost 4 放行剩 0
+    wkey = f"{key}:weighted"
+    code, b = call("POST", path, {"client_key": wkey, "limit": 10,
+                                  "window_ms": 10_000, "cost": 6})
+    check("weighted allow cost 6",
+          code == 200 and b["allowed"] and b["remaining"] == 4, f"{code} {b}")
+    code, b = call("POST", path, {"client_key": wkey, "limit": 10,
+                                  "window_ms": 10_000, "cost": 5})
+    check("weighted deny cost 5", code == 429 and not b["allowed"],
+          f"{code} {b}")
+    code, b = call("POST", path, {"client_key": wkey, "limit": 10,
+                                  "window_ms": 10_000, "cost": 4})
+    check("weighted allow cost 4 remaining 0",
+          code == 200 and b["allowed"] and b["remaining"] == 0, f"{code} {b}")
+
+    # 滑动恢复 + 旧数据自动清理：窗口 800ms 打满后等待滑出，应恢复全部额度
+    skey = f"{key}:sliding"
+    for _ in range(3):
+        code, b = call("POST", path, {"client_key": skey, "limit": 3,
+                                      "window_ms": 800, "cost": 1})
+        check("sliding fill", code == 200 and b["allowed"], f"{code} {b}")
+    code, b = call("POST", path, {"client_key": skey, "limit": 3,
+                                  "window_ms": 800, "cost": 1})
+    check("sliding full -> 429", code == 429, f"{code} {b}")
+    time.sleep(1.0)
+    now_ms = int(time.time() * 1000)
+    code, b = call("POST", path, {"client_key": skey, "limit": 3,
+                                  "window_ms": 800, "cost": 1})
+    check("sliding recovered full quota",
+          code == 200 and b["allowed"] and b["remaining"] == 2, f"{code} {b}")
+    # 旧记录已被清理：新窗口第一笔的 reset_at 应基于当前时刻而非最老旧记录
+    check("sliding old data cleaned (reset renewed)",
+          abs(b["reset_at_ms"] - (now_ms + 800)) < 1500, f"{b}")
+
+    # 并发不超额：20 个同键并发成本 1，limit=10，恰好 10 个放行
+    ckey = f"{key}:concurrent"
+
+    def one_hit(_):
+        return call("POST", path, {"client_key": ckey, "limit": 10,
+                                   "window_ms": 10_000, "cost": 1})
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        results = list(pool.map(one_hit, range(20)))
+    allowed = [r for code, r in results if code == 200 and r["allowed"]]
+    denied = [r for code, r in results if code == 429 and not r["allowed"]]
+    check("concurrent no over-admit",
+          len(allowed) == 10 and len(denied) == 10,
+          f"allowed={len(allowed)} denied={len(denied)}")
+    if allowed:
+        remainings = sorted(r["remaining"] for r in allowed)
+        check("concurrent remaining consistent",
+              remainings == list(range(0, 10)), f"{remainings}")
+        check("concurrent denied retry_after present",
+              all(r["retry_after_ms"] > 0 for r in denied), f"{denied[:2]}")
 
 
 if __name__ == "__main__":

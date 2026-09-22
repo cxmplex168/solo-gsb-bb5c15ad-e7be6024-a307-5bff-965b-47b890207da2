@@ -1,6 +1,6 @@
-"""租约状态机的全部写/判操作都在 Redis Lua 中原子完成。
+"""租约状态机与滑动窗口限流的全部写/判操作都在 Redis Lua 中原子完成。
 
-约定：
+租约约定：
 - 租约键（KEYS[1] 或 lease key）是一个 Hash：
     token       所有权令牌（UUID）
     fencing     防栅序号（单调递增）
@@ -8,6 +8,13 @@
 - 防栅计数器键独立存放、永不过期，保证同一任务键的 fencing 只增不减。
 - 过期判断一律使用 redis.call('TIME')，即 Redis 服务器时间，
   避免各客户端时钟不一致导致的问题。
+
+限流约定：
+- 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
+  member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
+  uuid 保证同毫秒并发请求的 member 不冲突。
+- 窗口判断、累计、扣减全部基于 redis.call('TIME') 的服务器时间，
+  单脚本原子执行，并发请求不会超额。
 """
 
 # 申请租约：仅当租约不存在或已过期时成功。
@@ -150,3 +157,53 @@ if expires_at <= now then
 end
 return {1, expires_at - now}
 """
+
+# 滑动窗口限流（成本累计）：原子完成"清旧 -> 累计 -> 判定 -> 扣减"。
+# 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
+# member 形如 "<唯一标识>:<cost>"，同一毫秒内的并发请求也不会互相覆盖；
+# 每笔成本直接编码在 member 尾部，无需额外的键。
+# KEYS[1] = 限流 ZSet 键
+# ARGV[1] = limit（窗口内允许的成本上限）
+# ARGV[2] = window_ms
+# ARGV[3] = cost（本次请求成本）
+# ARGV[4] = 唯一标识（uuid hex，保证 member 不冲突）
+# 放行返回 {1, remaining, reset_at_ms}
+# 超限返回 {0, remaining, reset_at_ms, retry_after_ms}
+# reset_at_ms 为窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
+LIMIT_CHECK_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local key = KEYS[1]
+
+local window_start = now - window
+
+-- 清理已滑出窗口的旧记录，ZSet 中只保留当前窗口内的成本
+redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+
+-- 从 member 尾部解析每笔成本并累计
+local used = 0
+local members = redis.call('ZRANGE', key, 0, -1)
+for _, m in ipairs(members) do
+  used = used + tonumber(string.match(m, ':(%d+)$'))
+end
+
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+local reset_at
+if #oldest == 0 then
+  reset_at = now + window
+else
+  reset_at = tonumber(oldest[2]) + window
+end
+
+if used + cost > limit then
+  return {0, limit - used, reset_at, reset_at - now}
+end
+
+redis.call('ZADD', key, now, ARGV[4] .. ':' .. cost)
+redis.call('PEXPIRE', key, window)
+return {1, limit - used - cost, reset_at}
+"""
+
