@@ -1,7 +1,7 @@
 """API 请求 / 响应模型。"""
 from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 BATCH_MIN_SIZE = 2
 BATCH_MAX_SIZE = 32
@@ -119,3 +119,53 @@ class LeaseStateResponse(BaseModel):
     fencing_token: int | None = None
     expires_at_ms: int | None = None
     remaining_ms: int = 0
+
+
+class LimitCheckRequest(BaseModel):
+    client_key: str = Field(
+        min_length=1,
+        max_length=512,
+        examples=["tenant-42:send-sms"],
+        description="限流对象标识；相同 client_key 共享同一滑动窗口配额",
+    )
+    limit: int = Field(
+        ge=1,
+        examples=[100],
+        description="单个窗口内允许累计的最大成本",
+    )
+    window_ms: int = Field(
+        gt=0,
+        examples=[60_000],
+        description="滑动窗口长度（毫秒）；合法区间由服务端配置约束",
+    )
+    cost: int = Field(
+        default=1,
+        ge=1,
+        examples=[1],
+        description="本次请求消耗的成本，不得大于 limit",
+    )
+
+    @model_validator(mode="after")
+    def cost_within_limit(self) -> "LimitCheckRequest":
+        if self.cost > self.limit:
+            raise ValueError("cost must not exceed limit")
+        return self
+
+
+class LimitCheckResponse(BaseModel):
+    allowed: bool
+    client_key: str
+    limit: int
+    window_ms: int
+    remaining: int = Field(
+        ge=0,
+        description="扣减后窗口内剩余配额（超限时为不扣减前提下的剩余值）",
+    )
+    reset_at_ms: int = Field(
+        description="窗口重置（最早一条记录滑出）时刻，Redis 服务器时钟 Unix 毫秒"
+    )
+    retry_after_ms: int | None = Field(
+        default=None,
+        ge=1,
+        description="仅超限时返回：建议等待多少毫秒后重试",
+    )

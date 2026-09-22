@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     default_ttl_ms: int = Field(
         default=10_000, validation_alias="LEASE_DEFAULT_TTL_MS"
     )
+    # 限流滑动窗口长度合法区间（毫秒），超出范围的请求会被拒绝
+    limit_min_window_ms: int = Field(
+        default=1, validation_alias="LIMIT_MIN_WINDOW_MS"
+    )
+    limit_max_window_ms: int = Field(
+        default=86_400_000, validation_alias="LIMIT_MAX_WINDOW_MS"
+    )
 
 
 @lru_cache

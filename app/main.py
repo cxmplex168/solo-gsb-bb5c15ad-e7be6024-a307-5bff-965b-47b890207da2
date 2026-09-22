@@ -1,10 +1,11 @@
-"""租约协调服务：多工作进程间的独占任务协调。
+"""租约协调服务：多工作进程间的独占任务协调与滑动窗口限流。
 
-所有租约状态转换均由 Redis Lua 脚本原子完成（见 app/lua.py），
+所有租约状态转换与限流判定均由 Redis Lua 脚本原子完成（见 app/lua.py），
 过期判断基于 Redis 服务器时间（TIME 命令）。
 """
 from __future__ import annotations
 
+import math
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from .config import Settings, get_settings
 from .lua import (
     ACQUIRE_BATCH_LUA,
     ACQUIRE_LUA,
+    LIMIT_CHECK_LUA,
     RELEASE_LUA,
     RENEW_LUA,
     VALIDATE_LUA,
@@ -30,6 +32,8 @@ from .schemas import (
     AcquireRequest,
     AcquireResponse,
     LeaseStateResponse,
+    LimitCheckRequest,
+    LimitCheckResponse,
     ReleaseRequest,
     ReleaseResponse,
     RenewRequest,
@@ -51,6 +55,7 @@ async def lifespan(app: FastAPI):
         renew=redis.register_script(RENEW_LUA),
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
+        limit_check=redis.register_script(LIMIT_CHECK_LUA),
     )
     yield
     await redis.aclose()
@@ -59,7 +64,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Lease API",
     version="1.0.0",
-    description="供多个工作进程协调独占任务的租约服务（FastAPI + Redis Lua）",
+    description="供多个工作进程协调独占任务的租约服务与滑动窗口限流（FastAPI + Redis Lua）",
     lifespan=lifespan,
 )
 
@@ -91,6 +96,23 @@ def lease_key(settings: Settings, task_key: str) -> str:
 
 def fencing_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:fencing:{task_key}"
+
+
+def limit_key(settings: Settings, client_key: str, window_ms: int) -> str:
+    # window_ms 入键：同一 client_key 使用不同窗口长度时互不干扰、各自清理
+    return f"{settings.key_prefix}:limit:{client_key}:{window_ms}"
+
+
+def resolve_window(window_ms: int, settings: Settings) -> int:
+    if not settings.limit_min_window_ms <= window_ms <= settings.limit_max_window_ms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"window_ms must be within "
+                f"[{settings.limit_min_window_ms}, {settings.limit_max_window_ms}]"
+            ),
+        )
+    return window_ms
 
 
 def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
@@ -245,6 +267,63 @@ async def validate(
         args=[req.token, str(req.fencing_token)],
     )
     return ValidateResponse(valid=bool(valid), remaining_ms=remaining_ms)
+
+
+@app.post(
+    "/v1/limits/check",
+    response_model=LimitCheckResponse,
+    responses={
+        429: {
+            "model": LimitCheckResponse,
+            "description": "超出窗口限额，未扣减；Retry-After 头给出秒级等待建议",
+        }
+    },
+)
+async def check_limit(
+    req: LimitCheckRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> LimitCheckResponse:
+    """滑动窗口限流检查（按成本扣减）。
+
+    以 Redis 服务器时间为基准，累计同一 client_key 当前窗口内已扣减的成本：
+    未超限（含本次成本）时原子扣减并返回剩余配额与窗口重置时刻；
+    已超限时不扣减，返回 **429** 及建议等待毫秒数（同时下发
+    `Retry-After` 头，秒级向上取整）。判定与扣减在单个 Lua 脚本内
+    原子完成，相同 client_key 的并发请求不会超额；窗口外记录由脚本清理，
+    键本身带 PEXPIRE，过期数据自动回收。
+    """
+    window = resolve_window(req.window_ms, settings)
+    nonce = uuid.uuid4().hex
+    result = await scripts.limit_check(
+        keys=[limit_key(settings, req.client_key, window)],
+        args=[req.limit, window, req.cost, f"{req.cost}:{nonce}"],
+    )
+    allowed = bool(result[0])
+    if allowed:
+        return LimitCheckResponse(
+            allowed=True,
+            client_key=req.client_key,
+            limit=req.limit,
+            window_ms=window,
+            remaining=result[1],
+            reset_at_ms=result[2],
+        )
+
+    retry_after_ms = result[3]
+    # Retry-After 仅支持秒级粒度，向上取整保证等待足够时间
+    response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after_ms / 1000)))
+    return LimitCheckResponse(
+        allowed=False,
+        client_key=req.client_key,
+        limit=req.limit,
+        window_ms=window,
+        remaining=result[1],
+        reset_at_ms=result[2],
+        retry_after_ms=retry_after_ms,
+    )
 
 
 @app.get("/v1/leases/{task_key:path}", response_model=LeaseStateResponse)

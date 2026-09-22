@@ -1,4 +1,4 @@
-"""租约状态机的全部写/判操作都在 Redis Lua 中原子完成。
+"""租约状态机与滑动窗口限流的全部写/判操作都在 Redis Lua 中原子完成。
 
 约定：
 - 租约键（KEYS[1] 或 lease key）是一个 Hash：
@@ -6,6 +6,8 @@
     fencing     防栅序号（单调递增）
     expires_at  过期时间，Unix 毫秒，基于 Redis 服务器时钟
 - 防栅计数器键独立存放、永不过期，保证同一任务键的 fencing 只增不减。
+- 限流键是一个 ZSet：score 为扣减时刻（Redis 服务器毫秒），
+  member 形如 "<cost>:<nonce>"，窗口外记录按 score 清理，键带 PEXPIRE。
 - 过期判断一律使用 redis.call('TIME')，即 Redis 服务器时间，
   避免各客户端时钟不一致导致的问题。
 """
@@ -149,4 +151,70 @@ if expires_at <= now then
   return {0, 0}
 end
 return {1, expires_at - now}
+"""
+
+# 滑动窗口限流（按成本计数）：
+# 先按 Redis 服务器时间清理窗口外记录，再累计窗口内成本；
+# 总成本 + 本次成本不超过限额才原子扣减，否则不写入任何记录。
+# ZSet 内每条记录 score = 扣减时刻（毫秒），member = "<cost>:<nonce>"。
+# 成功与否都刷新键的 PEXPIRE，窗口数据过期后由 Redis 自动清理。
+# KEYS[1]  = 限流键（按 client_key + window_ms 隔离）
+# ARGV[1]  = 限额 limit
+# ARGV[2]  = 窗口长度 window_ms
+# ARGV[3]  = 本次成本 cost
+# ARGV[4]  = 本次记录 member（"cost:nonce"，由调用方保证唯一）
+# 成功返回 {1, remaining, reset_at_ms}
+# 超限返回 {0, remaining, reset_at_ms, retry_after_ms}
+#   reset_at_ms    窗口重置（最早一条记录滑出）的时刻，无记录时为当前时刻
+#   retry_after_ms 至少多少毫秒后重试，即需要滑出多少成本后才放得下本次请求
+LIMIT_CHECK_LUA = """
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local cutoff = now - window
+
+-- 清理窗口外记录（score <= cutoff 已滑出窗口）
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+
+local used = 0
+local entries = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+for i = 1, #entries, 2 do
+  local c = tonumber(string.match(entries[i], '^(%d+):'))
+  if c then
+    used = used + c
+  end
+end
+
+local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+local reset_at = now
+if #oldest > 0 then
+  reset_at = tonumber(oldest[2]) + window
+end
+
+if used + cost > limit then
+  -- 从最早的记录开始，计算需滑出多少累计成本才放得下本次请求
+  local need = used + cost - limit
+  local rolled = 0
+  for i = 1, #entries, 2 do
+    local c = tonumber(string.match(entries[i], '^(%d+):'))
+    if c then
+      rolled = rolled + c
+      if rolled >= need then
+        local retry_after = tonumber(entries[i + 1]) + window - now
+        if retry_after < 1 then
+          retry_after = 1
+        end
+        return {0, limit - used, reset_at, retry_after}
+      end
+    end
+  end
+  return {0, limit - used, reset_at, window}
+end
+
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('PEXPIRE', KEYS[1], window)
+return {1, limit - used - cost, reset_at}
 """
